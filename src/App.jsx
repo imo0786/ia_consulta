@@ -700,9 +700,9 @@ export default function App() {
     setTimeline([]);
     setIcd10Suggestions([]);
     try { if (mp3Url) URL.revokeObjectURL(mp3Url); } catch {}
-    setMp3Url(\"\");
-    setMp3Info({ filename: \"\", size: 0 });
-    setMp3Error(\"\");
+    setMp3Url("");
+    setMp3Info({ filename: "", size: 0 });
+    setMp3Error("");
     setMp3Busy(false);
     if (persistLocal) {
       try { localStorage.removeItem(STORAGE_KEY); } catch {}

@@ -1,21 +1,15 @@
 import { createRequire } from "node:module";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 
 // Node runtime (no edge)
-export const config = {
-  runtime: "nodejs",
-};
+export const config = { runtime: "nodejs" };
 
 const require = createRequire(import.meta.url);
-const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
-
-if (ffmpegPath) {
-  ffmpeg.setFfmpegPath(ffmpegPath);
-}
 
 function readRequestBuffer(req) {
   return new Promise((resolve, reject) => {
@@ -30,6 +24,21 @@ function safeFilename(name) {
   const base = String(name || "grabacion.mp3").trim();
   const cleaned = base.replace(/[^a-zA-Z0-9._-]+/g, "_");
   return cleaned.toLowerCase().endsWith(".mp3") ? cleaned : cleaned + ".mp3";
+}
+
+async function runFfmpeg(args) {
+  if (!ffmpegPath) throw new Error("FFmpeg no disponible en el entorno (ffmpeg-static).");
+
+  return new Promise((resolve, reject) => {
+    const p = spawn(ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let err = "";
+    p.stderr.on("data", (d) => (err += d.toString()));
+    p.on("error", reject);
+    p.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(err || `FFmpeg falló (código ${code}).`));
+    });
+  });
 }
 
 export default async function handler(req, res) {
@@ -52,31 +61,33 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Vercel: carpeta temporal writable
     const tmp = os.tmpdir();
     const id = crypto.randomBytes(8).toString("hex");
 
-    // Elegimos extensión por content-type (solo para ffmpeg)
-    const ext = contentType.includes("ogg") ? "ogg" : (contentType.includes("wav") ? "wav" : "webm");
+    // extensión solo para ayudar a FFmpeg a inferir, no es la salida final
+    const ext = contentType.includes("ogg") ? "ogg" : contentType.includes("wav") ? "wav" : "webm";
     const inPath = path.join(tmp, `clinote_${id}.${ext}`);
     const outPath = path.join(tmp, `clinote_${id}.mp3`);
 
     await fs.writeFile(inPath, inputBuf);
 
-    await new Promise((resolve, reject) => {
-      ffmpeg(inPath)
-        .noVideo()
-        .audioCodec("libmp3lame")
-        .audioBitrate("128k")
-        .format("mp3")
-        .on("end", resolve)
-        .on("error", reject)
-        .save(outPath);
-    });
+    // Convertir a mp3 128k
+    await runFfmpeg([
+      "-y",
+      "-i",
+      inPath,
+      "-vn",
+      "-acodec",
+      "libmp3lame",
+      "-b:a",
+      "128k",
+      "-f",
+      "mp3",
+      outPath,
+    ]);
 
     const mp3Buf = await fs.readFile(outPath);
 
-    // limpieza
     try { await fs.unlink(inPath); } catch {}
     try { await fs.unlink(outPath); } catch {}
 
