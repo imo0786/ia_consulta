@@ -376,6 +376,16 @@ export default function App() {
   const [permissionError, setPermissionError] = useState("");
   const [interim, setInterim] = useState("");
 
+  // Audio (grabación + MP3 en backend)
+  const streamRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const [mp3Url, setMp3Url] = useState("");
+  const [mp3Busy, setMp3Busy] = useState(false);
+  const [mp3Error, setMp3Error] = useState("");
+  const [mp3Info, setMp3Info] = useState({ filename: "", size: 0 });
+
+
   // Datos
   const [meta, setMeta] = useState({
     datetimeLocal: new Date().toLocaleString("es-GT"),
@@ -542,22 +552,124 @@ export default function App() {
     };
   }, [SpeechRecognition]);
 
-  const requestMicPermission = async () => {
+  const requestMicStream = async () => {
     setPermissionError("");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach((t) => t.stop());
-      return true;
+      return stream;
     } catch {
-      setPermissionError("No se pudo acceder al micrófono. En Chrome: candadito en la barra → Micrófono → Permitir, y recargá.");
-      return false;
+      setPermissionError(
+        "No se pudo acceder al micrófono. En Chrome: candadito en la barra → Micrófono → Permitir, y recargá."
+      );
+      return null;
     }
   };
 
+  const startAudioRecording = (stream) => {
+    setMp3Error("");
+    try {
+      audioChunksRef.current = [];
+
+      const candidates = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/ogg;codecs=opus",
+        "audio/ogg",
+      ];
+      const mimeType =
+        candidates.find((m) => window.MediaRecorder?.isTypeSupported?.(m)) || "";
+
+      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      mediaRecorderRef.current = mr;
+
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+
+      mr.onstop = async () => {
+        try {
+          const type = mr.mimeType || "audio/webm";
+          const rawBlob = new Blob(audioChunksRef.current, { type });
+
+          // detener tracks del stream
+          try {
+            const s = streamRef.current;
+            if (s) s.getTracks().forEach((t) => t.stop());
+          } catch {}
+          streamRef.current = null;
+
+          // convertir a MP3 en backend
+          await convertRecordingToMp3(rawBlob);
+        } catch (e) {
+          setMp3Error(e?.message ? String(e.message) : "Error al preparar audio");
+        }
+      };
+
+      mr.start(1000);
+    } catch (e) {
+      setMp3Error("No se pudo iniciar la grabación de audio.");
+    }
+  };
+
+  const stopAudioRecording = () => {
+    try {
+      const mr = mediaRecorderRef.current;
+      if (mr && mr.state !== "inactive") mr.stop();
+    } catch {}
+  };
+
+  const convertRecordingToMp3 = async (blob) => {
+    setMp3Busy(true);
+    setMp3Error("");
+    try {
+      // nombre sugerido (paciente + fecha)
+      const safePatient = (patient?.name || "paciente")
+        .toString()
+        .trim()
+        .replace(/\s+/g, "_")
+        .replace(/[^a-zA-Z0-9_\-]/g, "");
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+      const filename = `APROFAM_ClinNote_${safePatient || "paciente"}_${stamp}.mp3`;
+
+      const res = await fetch("/api/audio/mp3", {
+        method: "POST",
+        headers: {
+          "Content-Type": blob.type || "audio/webm",
+          "X-Filename": filename,
+        },
+        body: blob,
+      });
+
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || `HTTP ${res.status}`);
+      }
+
+      const mp3Blob = await res.blob();
+      const url = URL.createObjectURL(mp3Blob);
+
+      setMp3Url((prev) => {
+        try { if (prev) URL.revokeObjectURL(prev); } catch {}
+        return url;
+      });
+      setMp3Info({ filename, size: mp3Blob.size });
+    } finally {
+      setMp3Busy(false);
+    }
+  };
+
+
   const start = async () => {
     if (!supportsSpeech) return;
-    const ok = await requestMicPermission();
-    if (!ok) return;
+    setMp3Error("");
+    const stream = await requestMicStream();
+    if (!stream) return;
+
+    // Guardamos stream para grabación
+    streamRef.current = stream;
+    // Arrancamos grabación en paralelo al dictado
+    startAudioRecording(stream);
+
     try {
       recognitionRef.current?.start();
       setIsListening(true);
@@ -571,6 +683,9 @@ export default function App() {
     try { recognitionRef.current?.stop(); } catch {}
     setIsListening(false);
     setInterim("");
+
+    // detener grabación (convierte a MP3 al finalizar)
+    stopAudioRecording();
   };
 
   const toggleMic = () => {
@@ -584,6 +699,11 @@ export default function App() {
     setInterim("");
     setTimeline([]);
     setIcd10Suggestions([]);
+    try { if (mp3Url) URL.revokeObjectURL(mp3Url); } catch {}
+    setMp3Url(\"\");
+    setMp3Info({ filename: \"\", size: 0 });
+    setMp3Error(\"\");
+    setMp3Busy(false);
     if (persistLocal) {
       try { localStorage.removeItem(STORAGE_KEY); } catch {}
     }
@@ -827,6 +947,31 @@ export default function App() {
                   >
                     Descargar PDF
                   </button>
+
+                  <button
+                    onClick={() => {
+                      if (!mp3Url) return;
+                      const a = document.createElement("a");
+                      a.href = mp3Url;
+                      a.download = mp3Info?.filename || "grabacion_clinote.mp3";
+                      a.click();
+                    }}
+                    disabled={!mp3Url || mp3Busy}
+                    className={cn(
+                      "rounded-xl px-3 py-2 text-sm font-semibold",
+                      BTN,
+                      (!mp3Url || mp3Busy) ? "opacity-60 cursor-not-allowed text-slate-600" : "text-slate-800"
+                    )}
+                  >
+                    {mp3Busy ? "Convirtiendo a MP3…" : "Descargar MP3"}
+                  </button>
+
+                  {mp3Error && (
+                    <div className="text-xs text-rose-700">
+                      {mp3Error}
+                    </div>
+                  )}
+
                   <button
                     onClick={clearAll}
                     className={cn("rounded-xl px-3 py-2 text-sm font-semibold text-rose-700", BTN)}
