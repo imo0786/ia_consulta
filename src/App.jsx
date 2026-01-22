@@ -39,40 +39,386 @@ function safeTrim(s) {
   return (s || "").replace(/\s+/g, " ").trim();
 }
 
-function buildPdfDocFromText(text) {
+// --- Sugerencias CIE-10 (cliente, reglas simples) ---
+// Nota: esto NO es un diagnóstico. Son sugerencias automáticas para apoyo clínico.
+// Podés ampliar/ajustar estas reglas según tu práctica y el CIE-10 que uses (OMS/CM).
+const ICD10_RULES = [
+  {
+    id: "headache",
+    re: /(dolor\s+de\s+cabeza|cefalea|migrañ?a|jaqueca)/i,
+    suggestions: [
+      { code: "R51", title: "Cefalea" },
+      { code: "G43.9", title: "Migraña, no especificada" },
+      { code: "G44.2", title: "Cefalea tensional" },
+      { code: "J01.9", title: "Sinusitis aguda, no especificada" },
+    ],
+  },
+  {
+    id: "sore_throat",
+    re: /(dolor\s+de\s+garganta|odinofagia|faringitis|amigdalitis)/i,
+    suggestions: [
+      { code: "J02.9", title: "Faringitis aguda, no especificada" },
+      { code: "J03.9", title: "Amigdalitis aguda, no especificada" },
+      { code: "J06.9", title: "Infección aguda de vías respiratorias superiores, no especificada" },
+    ],
+  },
+  {
+    id: "fever",
+    re: /(fiebre|febril|temperatura\s+alta)/i,
+    suggestions: [
+      { code: "R50.9", title: "Fiebre, no especificada" },
+      { code: "J06.9", title: "Infección aguda de vías respiratorias superiores, no especificada" },
+      { code: "A09", title: "Diarrea y gastroenteritis de presunto origen infeccioso" },
+    ],
+  },
+  {
+    id: "vomiting",
+    re: /(v[oó]mito|n[aá]usea|emesis)/i,
+    suggestions: [
+      { code: "R11", title: "Náuseas y vómitos" },
+      { code: "A09", title: "Diarrea y gastroenteritis de presunto origen infeccioso" },
+      { code: "K52.9", title: "Gastroenteritis y colitis no infecciosa, no especificada" },
+    ],
+  },
+];
+
+function deriveIcd10Suggestions(text, max = 5) {
+  const t = safeTrim(text || "");
+  if (!t) return [];
+  const out = [];
+  for (const rule of ICD10_RULES) {
+    if (rule.re.test(t)) {
+      for (const s of rule.suggestions || []) {
+        if (!out.some((x) => x.code === s.code)) out.push(s);
+      }
+    }
+  }
+  return out.slice(0, max);
+}
+
+
+function hexToRgb(hex) {
+  const h = String(hex || "").replace("#", "").trim();
+  if (h.length === 3) {
+    const r = parseInt(h[0] + h[0], 16);
+    const g = parseInt(h[1] + h[1], 16);
+    const b = parseInt(h[2] + h[2], 16);
+    return { r, g, b };
+  }
+  if (h.length !== 6) return { r: 0, g: 0, b: 0 };
+  return {
+    r: parseInt(h.slice(0, 2), 16),
+    g: parseInt(h.slice(2, 4), 16),
+    b: parseInt(h.slice(4, 6), 16),
+  };
+}
+
+function setFillHex(doc, hex) {
+  const { r, g, b } = hexToRgb(hex);
+  doc.setFillColor(r, g, b);
+}
+
+function setTextHex(doc, hex) {
+  const { r, g, b } = hexToRgb(hex);
+  doc.setTextColor(r, g, b);
+}
+
+function truncateText(s, max = 180) {
+  const t = safeTrim(s || "");
+  if (!t) return "";
+  return t.length > max ? t.slice(0, max - 1).trim() + "…" : t;
+}
+
+function buildStyledPdfDoc(meta, sections, transcript, extra = {}) {
+  // Paleta APROFAM
+  const C1 = "#1160C7"; // azul
+  const C2 = "#FFC600"; // amarillo
+  const C3 = "#00315E"; // azul fuerte
+  const SOFT = "#F4F7FB";
+  const TEXT = "#111827"; // slate-900
+  const MUTED = "#6B7280"; // slate-500
+
   const doc = new jsPDF({ unit: "pt", format: "a4" });
   doc.setFont("helvetica", "normal");
-  doc.setFontSize(11);
 
   const pageW = doc.internal.pageSize.getWidth();
   const pageH = doc.internal.pageSize.getHeight();
   const margin = 44;
-  const maxW = pageW - margin * 2;
-  const lineH = 14;
+  const headerH = 46;
+  const footerH = 26;
+  const contentW = pageW - margin * 2;
 
-  const lines = doc.splitTextToSize(String(text || ""), maxW);
-  let y = margin;
+  const drawHeader = () => {
+    setFillHex(doc, C3);
+    doc.rect(0, 0, pageW, headerH, "F");
+    setFillHex(doc, C2);
+    doc.rect(0, headerH - 4, pageW, 4, "F");
 
-  for (let i = 0; i < lines.length; i++) {
-    if (y > pageH - margin) {
-      doc.addPage();
-      y = margin;
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(14);
+    setTextHex(doc, "#FFFFFF");
+    doc.text("APROFAM ClinNote", margin, 28);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    setTextHex(doc, "#E5E7EB");
+    const dt = meta?.datetimeLocal ? String(meta.datetimeLocal) : "";
+    doc.text(dt, pageW - margin, 28, { align: "right" });
+  };
+
+  const addPage = () => {
+    doc.addPage();
+    drawHeader();
+    return headerH + 18;
+  };
+
+  const ensureSpace = (y, needed = 0) => {
+    if (y + needed > pageH - margin - footerH) {
+      return addPage();
     }
-    doc.text(String(lines[i] ?? ""), margin, y);
-    y += lineH;
+    return y;
+  };
+
+  const drawInfoBox = (y) => {
+    const boxH = 92;
+    y = ensureSpace(y, boxH + 12);
+
+    // fondo
+    setFillHex(doc, SOFT);
+    doc.roundedRect(margin, y, contentW, boxH, 10, 10, "F");
+
+    // borde superior (azul)
+    setFillHex(doc, C1);
+    doc.roundedRect(margin, y, contentW, 6, 10, 10, "F");
+
+    const x1 = margin + 14;
+    const x2 = margin + contentW / 2 + 8;
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10);
+    setTextHex(doc, C3);
+    doc.text("DATOS DEL PACIENTE", x1, y + 22);
+    doc.text("DATOS DE LA CONSULTA", x2, y + 22);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    setTextHex(doc, TEXT);
+
+    const patientName = meta?.patientName ? String(meta.patientName) : "";
+    const patientAge = meta?.patientAge ? String(meta.patientAge) : "";
+    const patientSex = meta?.patientSex ? String(meta.patientSex) : "";
+    const patientId = meta?.patientId ? String(meta.patientId) : "";
+    const patientDpi = meta?.patientDpi ? String(meta.patientDpi) : "";
+    const patientPhone = meta?.patientPhone ? String(meta.patientPhone) : "";
+
+    const clinician = meta?.clinician ? String(meta.clinician) : "";
+    const site = meta?.site ? String(meta.site) : "";
+    const consent = meta?.consent ? "Sí" : "No";
+
+    const leftLines = [
+      patientName ? `Nombre: ${patientName}` : "Nombre: (sin registro)",
+      (patientAge || patientSex) ? `Edad/Sexo: ${[patientAge || "—", patientSex || "—"].join(" / ")}` : "Edad/Sexo: (sin registro)",
+      patientId ? `Expediente: ${patientId}` : "Expediente: (sin registro)",
+      [patientDpi ? `DPI: ${patientDpi}` : "", patientPhone ? `Tel: ${patientPhone}` : ""].filter(Boolean).join("   "),
+    ].filter(Boolean);
+
+    const rightLines = [
+      clinician ? `Médico: ${clinician}` : "Médico: (sin registro)",
+      site ? `Sede: ${site}` : "Sede: (sin registro)",
+      `Consentimiento: ${consent}`,
+      extra?.aiUpdatedAt ? `Último análisis IA: ${String(extra.aiUpdatedAt)}` : "",
+    ].filter(Boolean);
+
+    let ly = y + 40;
+    leftLines.forEach((ln) => {
+      doc.text(String(ln), x1, ly);
+      ly += 14;
+    });
+
+    let ry = y + 40;
+    rightLines.forEach((ln) => {
+      doc.text(String(ln), x2, ry);
+      ry += 14;
+    });
+
+    return y + boxH + 18;
+  };
+
+  const drawSection = (y, title, body, opts = {}) => {
+    const barH = 18;
+    y = ensureSpace(y, barH + 10);
+
+    // barra título
+    setFillHex(doc, opts.barColor || C1);
+    doc.roundedRect(margin, y, contentW, barH, 8, 8, "F");
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10);
+    setTextHex(doc, "#FFFFFF");
+    doc.text(String(title || "").toUpperCase(), margin + 12, y + 13);
+
+    y += barH + 8;
+
+    // contenido
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(11);
+    setTextHex(doc, TEXT);
+
+    const txt = safeTrim(body || "");
+    const content = txt ? txt : "(sin registro)";
+    const lines = doc.splitTextToSize(String(content), contentW - 8);
+
+    for (let i = 0; i < lines.length; i++) {
+      y = ensureSpace(y, 14);
+      doc.text(String(lines[i] ?? ""), margin + 4, y);
+      y += 14;
+    }
+
+    return y + 10;
+  };
+
+  const drawBullets = (y, title, bullets, opts = {}) => {
+    if (!Array.isArray(bullets) || bullets.length === 0) return y;
+    y = drawSection(y, title, "", { barColor: opts.barColor || C3 });
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(11);
+    setTextHex(doc, TEXT);
+
+    for (const b of bullets) {
+      const btxt = safeTrim(b);
+      if (!btxt) continue;
+      const wrap = doc.splitTextToSize("• " + btxt, contentW - 8);
+      for (let i = 0; i < wrap.length; i++) {
+        y = ensureSpace(y, 14);
+        doc.text(String(wrap[i] ?? ""), margin + 4, y);
+        y += 14;
+      }
+      y += 2;
+    }
+
+    return y + 6;
+  };
+
+  // --- armado ---
+  drawHeader();
+
+  let y = headerH + 18;
+
+  // Info boxes
+  y = drawInfoBox(y);
+
+  const ordered = [
+    { key: "motivo", label: "Motivo de la consulta" },
+    { key: "antecedentes", label: "Antecedentes" },
+    { key: "impresion", label: "Impresión clínica" },
+    { key: "signos", label: "Signos vitales" },
+    { key: "diagnostico", label: "Diagnóstico" },
+    { key: "prescripcion", label: "Prescripción / Receta" },
+    { key: "plan", label: "Plan / Indicaciones" },
+    { key: "estudios", label: "Estudios solicitados" },
+    { key: "referencias", label: "Referencias / Interconsultas" },
+    { key: "acuerdos", label: "Acuerdos / Próximos pasos" },
+  ];
+
+  for (const s of ordered) {
+    y = drawSection(y, s.label, sections?.[s.key] || "");
+
+    // CIE-10 sugerencias bajo diagnóstico
+    if (s.key === "diagnostico") {
+      const baseText = [sections?.motivo, sections?.impresion, sections?.diagnostico, sections?.prescripcion, transcript].filter(Boolean).join(" ");
+      const sug = deriveIcd10Suggestions(baseText, 5);
+      if (sug.length) {
+        const list = sug.map((x) => `${x.code} — ${x.title}`);
+        // Usamos barra amarilla con texto azul fuerte
+        y = ensureSpace(y, 28);
+        setFillHex(doc, C2);
+        doc.roundedRect(margin, y, contentW, 18, 8, 8, "F");
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(10);
+        setTextHex(doc, C3);
+        doc.text("Sugerencias CIE-10 (referencia)", margin + 12, y + 13);
+        y += 26;
+
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(11);
+        setTextHex(doc, TEXT);
+
+        for (const item of list) {
+          const wrap = doc.splitTextToSize("• " + item, contentW - 8);
+          for (let i = 0; i < wrap.length; i++) {
+            y = ensureSpace(y, 14);
+            doc.text(String(wrap[i] ?? ""), margin + 4, y);
+            y += 14;
+          }
+          y += 2;
+        }
+
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(9);
+        setTextHex(doc, MUTED);
+        y = ensureSpace(y, 14);
+        doc.text("Nota: esto NO es un diagnóstico. Es una referencia automática para apoyo clínico.", margin + 4, y);
+        y += 18;
+      }
+    }
+  }
+
+  // Conclusión final (sin inventar: solo resume lo capturado)
+  const bullets = [];
+  const motivo = safeTrim(sections?.motivo || "");
+  const impresion = safeTrim(sections?.impresion || "");
+  const dx = safeTrim(sections?.diagnostico || "");
+  const rx = safeTrim(sections?.prescripcion || "");
+  const plan = safeTrim(sections?.plan || "");
+  const estudios = safeTrim(sections?.estudios || "");
+  const seguimiento = safeTrim(sections?.acuerdos || "");
+
+  if (motivo) bullets.push(`Motivo: ${truncateText(motivo, 220)}`);
+  if (impresion) bullets.push(`Impresión: ${truncateText(impresion, 220)}`);
+  if (dx) bullets.push(`Diagnóstico documentado: ${truncateText(dx, 220)}`);
+  if (rx) bullets.push(`Prescripción/Receta: ${truncateText(rx, 220)}`);
+  if (plan) bullets.push(`Plan/Indicaciones: ${truncateText(plan, 220)}`);
+  if (estudios) bullets.push(`Estudios solicitados: ${truncateText(estudios, 220)}`);
+  if (seguimiento) bullets.push(`Seguimiento/Próximos pasos: ${truncateText(seguimiento, 220)}`);
+
+  y = drawBullets(y, "Conclusión final", bullets, { barColor: C3 });
+
+  // Transcripción completa como anexo (si existe)
+  const t = safeTrim(transcript || "");
+  if (t) {
+    y = drawSection(y, "Anexo: Transcripción completa", t, { barColor: C1 });
+  }
+
+  // Footer en TODAS las páginas (con numeración)
+  const totalPages = doc.getNumberOfPages();
+  for (let p = 1; p <= totalPages; p++) {
+    doc.setPage(p);
+    // línea
+    setFillHex(doc, "#E5E7EB");
+    doc.rect(margin, pageH - margin - footerH + 6, contentW, 1, "F");
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    setTextHex(doc, C3);
+    doc.text("Generado por APROFAM ClinNote — Revisar y validar antes de archivar.", margin, pageH - margin - 8);
+
+    doc.setFontSize(9);
+    setTextHex(doc, MUTED);
+    doc.text(`Página ${p} de ${totalPages}`, pageW - margin, pageH - margin - 8, { align: "right" });
   }
 
   return doc;
 }
 
-function exportTextToPDF(text, filenameBase = "APROFAM_ClinNote") {
-  const doc = buildPdfDocFromText(text);
+function exportClinotePDF(meta, sections, transcript, extra = {}, filenameBase = "APROFAM_ClinNote") {
+  const doc = buildStyledPdfDoc(meta, sections, transcript, extra);
   const date = new Date().toISOString().slice(0, 10);
   doc.save(`${filenameBase}_${date}.pdf`);
 }
 
-function pdfBlobUrlFromText(text) {
-  const doc = buildPdfDocFromText(text);
+function pdfBlobUrlFromClinote(meta, sections, transcript, extra = {}) {
+  const doc = buildStyledPdfDoc(meta, sections, transcript, extra);
   const blob = doc.output("blob");
   return URL.createObjectURL(blob);
 }
@@ -84,7 +430,11 @@ function buildReport(meta, sections, transcript, extra = {}) {
   lines.push(`Fecha/Hora: ${meta.datetimeLocal || ""}`);
   if (meta.clinician) lines.push(`Médico: ${meta.clinician}`);
   if (meta.site) lines.push(`Sede: ${meta.site}`);
-  if (meta.patientId) lines.push(`Paciente (ID): ${meta.patientId}`);
+  if (meta.patientName) lines.push(`Paciente: ${meta.patientName}`);
+  const demo = [meta.patientAge ? `Edad: ${meta.patientAge}` : "", meta.patientSex ? `Sexo: ${meta.patientSex}` : ""].filter(Boolean).join(" | ");
+  if (demo) lines.push(demo);
+  const ids = [meta.patientId ? `Expediente: ${meta.patientId}` : "", meta.patientDpi ? `DPI: ${meta.patientDpi}` : "", meta.patientPhone ? `Tel: ${meta.patientPhone}` : ""].filter(Boolean).join(" | ");
+  if (ids) lines.push(ids);
   if (meta.consent) lines.push("Consentimiento: Registrado");
   if (extra.aiUpdatedAt) lines.push(`Último análisis IA: ${extra.aiUpdatedAt}`);
   lines.push("");
@@ -103,13 +453,28 @@ function buildReport(meta, sections, transcript, extra = {}) {
   ];
 
   ordered.forEach((k) => {
-    const def = SECTION_DEFS.find((x) => x.key === k);
-    if (!def) return;
-    const txt = safeTrim(sections[k]);
-    lines.push(def.label.toUpperCase());
-    lines.push(txt ? txt : "(sin registro)");
+  const def = SECTION_DEFS.find((x) => x.key === k);
+  if (!def) return;
+  const txt = safeTrim(sections[k]);
+  lines.push(def.label.toUpperCase());
+  lines.push(txt ? txt : "(sin registro)");
+
+  // Sugerencias CIE-10 (solo referencia)
+  if (
+    k === "diagnostico" &&
+    Array.isArray(extra.icd10Suggestions) &&
+    extra.icd10Suggestions.length
+  ) {
     lines.push("");
-  });
+    lines.push("SUGERENCIAS CIE-10 (REFERENCIA)");
+    extra.icd10Suggestions.forEach((s) => {
+      lines.push(`- ${s.code} — ${s.title}`);
+    });
+    lines.push("Nota: Sugerencias automáticas; validar con criterio clínico.");
+  }
+
+  lines.push("");
+});
 
   if (Array.isArray(extra.alerts) && extra.alerts.length) {
     lines.push("ALERTAS / VALIDACIONES (IA)");
@@ -365,7 +730,13 @@ export default function App() {
     datetimeLocal: new Date().toLocaleString("es-GT"),
     clinician: "",
     site: "",
-    patientId: "",
+    // Datos del paciente (opcionales)
+    patientName: "",
+    patientAge: "",
+    patientSex: "",
+    patientDpi: "",
+    patientPhone: "",
+    patientId: "", // No. expediente / ID interno
     consent: false,
   });
 
@@ -479,10 +850,35 @@ export default function App() {
   };
 
   // ---- Reportes ----
-  const reportManual = useMemo(() => buildReport(meta, sections, fullTranscript, {}), [meta, sections, fullTranscript]);
+
+const icd10Suggestions = useMemo(() => {
+  // Fuente principal: motivo/impresión/diagnóstico + transcripción.
+  // Si IA está activa, tomamos sus campos (más “limpios”); si no, los manuales.
+  const src = aiEnabled ? aiSections : sections;
+
+  const ctx = safeTrim(
+    [
+      src.motivo,
+      src.antecedentes,
+      src.impresion,
+      src.signos,
+      src.diagnostico,
+      src.prescripcion,
+      fullTranscript,
+    ].join(" ")
+  );
+
+  return deriveIcd10Suggestions(ctx, 6);
+}, [aiEnabled, aiSections, sections, fullTranscript]);
+
+
+  const reportManual = useMemo(
+    () => buildReport(meta, sections, fullTranscript, { icd10Suggestions }),
+    [meta, sections, fullTranscript, icd10Suggestions]
+  );
 
   const reportAI = useMemo(
-    () => buildReport(meta, aiSections, fullTranscript, { aiUpdatedAt, alerts: aiAlerts, questions: aiQuestions }),
+    () => buildReport(meta, aiSections, fullTranscript, { aiUpdatedAt, alerts: aiAlerts, questions: aiQuestions, icd10Suggestions }),
     [meta, aiSections, fullTranscript, aiUpdatedAt, aiAlerts, aiQuestions]
   );
 
@@ -497,9 +893,12 @@ export default function App() {
       return;
     }
 
+    const pdfSections = aiEnabled ? aiSections : sections;
+    const pdfExtra = aiEnabled ? { aiUpdatedAt } : {};
+
     const t = setTimeout(() => {
       try {
-        const url = pdfBlobUrlFromText(effectiveReport || "");
+        const url = pdfBlobUrlFromClinote(meta, pdfSections, fullTranscript, pdfExtra);
         if (pdfUrlRef.current) URL.revokeObjectURL(pdfUrlRef.current);
         pdfUrlRef.current = url;
         setPdfUrl(url);
@@ -509,7 +908,7 @@ export default function App() {
     }, 700);
 
     return () => clearTimeout(t);
-  }, [pdfPreview, effectiveReport]);
+  }, [pdfPreview, meta, aiEnabled, aiSections, sections, fullTranscript, aiUpdatedAt]);
 
   const sectionCompleteness = useMemo(() => {
     const required = ["motivo", "antecedentes", "impresion", "signos", "diagnostico", "prescripcion"];
@@ -802,7 +1201,15 @@ export default function App() {
   };
 
   const exportPDF = () => {
-    exportTextToPDF(effectiveReport, aiEnabled ? "APROFAM_ClinNote_IA" : "APROFAM_ClinNote");
+    const pdfSections = aiEnabled ? aiSections : sections;
+    const pdfExtra = aiEnabled ? { aiUpdatedAt } : {};
+    exportClinotePDF(
+      meta,
+      pdfSections,
+      fullTranscript,
+      pdfExtra,
+      aiEnabled ? "APROFAM_ClinNote_IA" : "APROFAM_ClinNote"
+    );
   };
 
   // UI source: si IA está activa, editás sobre la estructura IA
@@ -1002,11 +1409,80 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="text-xs font-semibold text-slate-600">Paciente (ID)</label>
+                  <label className="text-xs font-semibold text-slate-600">Nombre del paciente</label>
                   <div className={cn("mt-1 rounded-xl px-3 py-2", INSET)}>
-                    <input value={meta.patientId} onChange={(e) => setMeta((p) => ({ ...p, patientId: e.target.value }))} className="w-full bg-transparent text-sm text-slate-800 outline-none" />
+                    <input
+                      value={meta.patientName}
+                      onChange={(e) => setMeta((p) => ({ ...p, patientName: e.target.value }))}
+                      className="w-full bg-transparent text-sm text-slate-800 outline-none"
+                    />
                   </div>
                 </div>
+
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600">Edad</label>
+                    <div className={cn("mt-1 rounded-xl px-3 py-2", INSET)}>
+                      <input
+                        value={meta.patientAge}
+                        onChange={(e) => setMeta((p) => ({ ...p, patientAge: e.target.value }))}
+                        className="w-full bg-transparent text-sm text-slate-800 outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600">Sexo</label>
+                    <div className={cn("mt-1 rounded-xl px-3 py-2", INSET)}>
+                      <select
+                        value={meta.patientSex}
+                        onChange={(e) => setMeta((p) => ({ ...p, patientSex: e.target.value }))}
+                        className="w-full bg-transparent text-sm text-slate-800 outline-none"
+                      >
+                        <option value="">(sin registro)</option>
+                        <option value="F">F</option>
+                        <option value="M">M</option>
+                        <option value="Otro">Otro</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600">DPI</label>
+                    <div className={cn("mt-1 rounded-xl px-3 py-2", INSET)}>
+                      <input
+                        value={meta.patientDpi}
+                        onChange={(e) => setMeta((p) => ({ ...p, patientDpi: e.target.value }))}
+                        className="w-full bg-transparent text-sm text-slate-800 outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600">Teléfono</label>
+                    <div className={cn("mt-1 rounded-xl px-3 py-2", INSET)}>
+                      <input
+                        value={meta.patientPhone}
+                        onChange={(e) => setMeta((p) => ({ ...p, patientPhone: e.target.value }))}
+                        className="w-full bg-transparent text-sm text-slate-800 outline-none"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="text-xs font-semibold text-slate-600">No. expediente / ID</label>
+                  <div className={cn("mt-1 rounded-xl px-3 py-2", INSET)}>
+                    <input
+                      value={meta.patientId}
+                      onChange={(e) => setMeta((p) => ({ ...p, patientId: e.target.value }))}
+                      className="w-full bg-transparent text-sm text-slate-800 outline-none"
+                    />
+                  </div>
+                </div>
+</div>
 
                 <label className="flex items-center gap-2 text-sm">
                   <input type="checkbox" checked={meta.consent} onChange={(e) => setMeta((p) => ({ ...p, consent: e.target.checked }))} className="h-4 w-4 rounded" />
@@ -1056,6 +1532,43 @@ export default function App() {
                       className="mt-2 w-full resize-y rounded-xl bg-transparent px-2 py-2 text-sm text-slate-800 outline-none placeholder:text-slate-500"
                       placeholder={`Escribí o dictá aquí: ${s.label}`}
                     />
+
+{s.key === "diagnostico" && icd10Suggestions.length > 0 && (
+  <div className={cn("mt-3 rounded-xl p-3 text-xs text-slate-700", INSET)}>
+    <div className="font-semibold">Sugerencias CIE-10 (referencia)</div>
+    <div className="mt-1 text-[11px] text-slate-500">
+      Generadas desde lo dictado/escrito. No sustituyen criterio clínico.
+    </div>
+
+    <ul className="mt-2 space-y-2">
+      {icd10Suggestions.slice(0, 6).map((d) => (
+        <li key={d.code} className="flex items-start justify-between gap-3">
+          <div className="leading-snug">
+            <span className="font-semibold">{d.code}</span>{" "}
+            <span className="text-slate-600">—</span> {d.title}
+          </div>
+          <button
+            onClick={() => {
+              const line = `${d.code} — ${d.title}`;
+              setSections((p) => ({
+                ...p,
+                diagnostico: safeTrim(`${p.diagnostico} ${line}`),
+              }));
+              setAiSections((p) => ({
+                ...p,
+                diagnostico: safeTrim(`${p.diagnostico} ${line}`),
+              }));
+            }}
+            className={cn("shrink-0 rounded-lg px-3 py-1 text-xs font-semibold", BTN, "text-slate-800")}
+            title="Agregar a Diagnóstico"
+          >
+            Agregar
+          </button>
+        </li>
+      ))}
+    </ul>
+  </div>
+)}
                   </div>
                 ))}
               </div>
@@ -1124,14 +1637,8 @@ export default function App() {
               </div>
             </div>
 
-            <div className={cn("mt-4 rounded-2xl p-4 text-sm text-slate-700", CARD)}>
-              <div className="font-semibold">Mejora aplicada</div>
-              <ul className="mt-2 list-disc space-y-1 pl-5">
-                <li>Ahora el texto se distribuye automáticamente entre <b>Diagnóstico</b>, <b>Receta</b>, <b>Motivo</b>, etc. (aunque no digas “Diagnóstico:”).</li>
-                <li>Si en una frase viene “tratamiento…” y luego “diagnóstico…”, se separa.</li>
-                <li>La transcripción completa se guarda siempre (sirve para el PDF).</li>
-              </ul>
-            </div>
+            
+
           </div>
         </div>
       </div>
