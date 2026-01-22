@@ -2,13 +2,13 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import jsPDF from "jspdf";
 
 /**
- * ClinNote — Prototipo v3.1 (cliente) + análisis IA (backend)
+ * APROFAM ClinNote — Prototipo (cliente) + análisis IA (backend)
  * - Dictado: Web Speech API (SpeechRecognition) en es-GT
  * - Auto-sección: si dictás "Diagnóstico: ..." cambia de sección y captura el contenido
- * - IA (opcional): manda SOLO texto (no audio) a tu backend para estructurar campos en “casi tiempo real”
- * - PDF: botón de descarga + vista previa PDF (auto) dentro de la app
+ * - Heurística local + heurística backend: separa en Diagnóstico / Receta / Motivo / Signos, etc.
+ * - PDF: descarga + vista previa (auto)
  *
- * Requisito: npm i jspdf
+ * Nota: el backend NO recibe audio, solo texto (delta_text).
  */
 
 const SECTION_DEFS = [
@@ -29,7 +29,7 @@ const DEFAULT_SECTIONS = SECTION_DEFS.reduce((acc, s) => {
   return acc;
 }, {});
 
-const STORAGE_KEY = "clinote_state_v3_1";
+const STORAGE_KEY = "apro_clinote_state_v4";
 
 function cn(...cls) {
   return cls.filter(Boolean).join(" ");
@@ -65,7 +65,7 @@ function buildPdfDocFromText(text) {
   return doc;
 }
 
-function exportTextToPDF(text, filenameBase = "informe_clinote") {
+function exportTextToPDF(text, filenameBase = "APROFAM_ClinNote") {
   const doc = buildPdfDocFromText(text);
   const date = new Date().toISOString().slice(0, 10);
   doc.save(`${filenameBase}_${date}.pdf`);
@@ -159,6 +159,180 @@ function detectSectionHeader(text) {
   return { key: null, cleaned: t };
 }
 
+function splitSegments(text) {
+  const t = safeTrim(text);
+  if (!t) return [];
+  return t
+    .split(/[\.\n;]+/g)
+    .map((x) => safeTrim(x))
+    .filter(Boolean);
+}
+
+function splitIfMixedRxDx(seg) {
+  const l = seg.toLowerCase();
+  const hasDx = l.includes("diagnos") || /\bdx\b/i.test(seg) || l.includes("impresi");
+  const hasRx =
+    l.includes("tratamiento") ||
+    l.includes("receta") ||
+    l.includes("prescrib") ||
+    l.includes("se le deja") ||
+    l.includes("se deja") ||
+    l.includes("se indica") ||
+    /\b\d+\s*mg\b/i.test(seg) ||
+    l.includes("cada ") ||
+    l.includes("por ") ||
+    l.includes("días") ||
+    l.includes("dias");
+
+  if (hasDx && hasRx) {
+    const idx = l.indexOf("diagnos");
+    if (idx > 8) {
+      const a = safeTrim(seg.slice(0, idx));
+      const b = safeTrim(seg.slice(idx));
+      return [a, b].filter(Boolean);
+    }
+  }
+  return [seg];
+}
+
+function bestBucket(seg, fallbackKey = "impresion") {
+  const s = seg.toLowerCase();
+
+  const score = {
+    motivo: 0,
+    antecedentes: 0,
+    impresion: 0,
+    signos: 0,
+    diagnostico: 0,
+    prescripcion: 0,
+    plan: 0,
+    estudios: 0,
+    referencias: 0,
+    acuerdos: 0,
+  };
+
+  // Diagnóstico
+  if (s.includes("diagnos") || /\bdx\b/.test(s) || s.includes("impresi") || s.includes("compatible con") || s.includes("se concluye"))
+    score.diagnostico += 6;
+
+  // Medicamentos (pequeña lista + heurística)
+  const meds = /(amoxicilina|azitromicina|ibuprofeno|paracetamol|acetaminof[eé]n|naproxeno|omeprazol|metformina|loratadina|salbutamol|prednisona)/i;
+  if (meds.test(seg)) score.prescripcion += 6;
+
+  // Receta / prescripción
+  if (
+    s.includes("tratamiento") ||
+    s.includes("receta") ||
+    s.includes("prescrib") ||
+    s.includes("se le deja") ||
+    s.includes("se deja") ||
+    s.includes("se indica") ||
+    s.includes("medic") ||
+    /\b\d+\s*mg\b/.test(s) ||
+    /\bcada\s*\d+\s*(hora|horas)\b/.test(s) ||
+    /\bpor\s*\d+\s*(d[ií]a|d[ií]as|semanas)\b/.test(s)
+  ) score.prescripcion += 6;
+
+  // Signos vitales
+  if (
+    /\bta\b/.test(s) ||
+    s.includes("presión") ||
+    s.includes("mmhg") ||
+    /\bfc\b/.test(s) ||
+    /\bfr\b/.test(s) ||
+    s.includes("pulso") ||
+    s.includes("lpm") ||
+    s.includes("rpm") ||
+    s.includes("satur") ||
+    s.includes("sat") ||
+    s.includes("temper") ||
+    /\b\d{2,3}\s*\/\s*\d{2,3}\b/.test(s)
+  ) score.signos += 6;
+
+  // Antecedentes
+  if (
+    s.includes("anteced") ||
+    s.includes("alerg") ||
+    s.includes("hipert") ||
+    s.includes("diab") ||
+    s.includes("cirug") ||
+    s.includes("asma") ||
+    s.includes("medicación crónica") ||
+    s.includes("medicacion cronica")
+  ) score.antecedentes += 4;
+
+  // Motivo / síntomas
+  if (
+    s.includes("dolor") ||
+    s.includes("fiebre") ||
+    s.includes("vómit") ||
+    s.includes("vomit") ||
+    s.includes("náuse") ||
+    s.includes("nause") ||
+    s.includes("diarre") ||
+    s.includes("tos") ||
+    s.includes("gargant") ||
+    s.includes("cefale") ||
+    s.includes("mareo") ||
+    s.includes("cansancio") ||
+    s.includes("deshidrat") ||
+    s.includes("inicio de") ||
+    s.includes("desde hace") ||
+    s.includes("durante")
+  ) score.motivo += 4;
+
+  // Estudios
+  if (s.includes("laboratorio") || s.includes("rayos") || s.includes("rx") || s.includes("ultra") || s.includes("examen") || s.includes("prueba"))
+    score.estudios += 4;
+
+  // Plan / indicaciones
+  if (s.includes("reposo") || s.includes("hidrat") || s.includes("control") || s.includes("seguimiento") || s.includes("retornar") || s.includes("cita"))
+    score.plan += 3;
+
+  // Referencias / interconsulta
+  if (s.includes("interconsulta") || s.includes("refer") || s.includes("especialista")) score.referencias += 3;
+
+  // Impresión (fallback si describe cuadro)
+  if (s.includes("cuadro") || s.includes("compatible") || s.includes("sugiere") || s.includes("probable")) score.impresion += 2;
+
+  let best = fallbackKey;
+  let bestScore = 0;
+  for (const [k, v] of Object.entries(score)) {
+    if (v > bestScore) {
+      bestScore = v;
+      best = k;
+    }
+  }
+  return bestScore > 0 ? best : fallbackKey;
+}
+
+function smartDistributeText(prev, text, fallbackKey) {
+  const next = { ...prev };
+  const segs = splitSegments(text);
+  let did = false;
+
+  for (const seg0 of segs) {
+    // 1) Encabezados explícitos (Diagnóstico:, Receta:, etc.)
+    const h = detectSectionHeader(seg0);
+    if (h.key) {
+      const cleaned = safeTrim(h.cleaned);
+      if (cleaned) next[h.key] = safeTrim(`${next[h.key] || ""} ${cleaned}`);
+      did = true;
+      continue;
+    }
+
+    // 2) Oración mixta (tratamiento + diagnóstico)
+    const pieces = splitIfMixedRxDx(seg0);
+    for (const seg of pieces) {
+      const bucket = bestBucket(seg, fallbackKey || "impresion");
+      next[bucket] = safeTrim(`${next[bucket] || ""} ${seg}`);
+      did = true;
+    }
+  }
+
+  return { next, did };
+}
+
 export default function App() {
   const SpeechRecognition =
     typeof window !== "undefined" &&
@@ -203,9 +377,9 @@ export default function App() {
   const [pdfUrl, setPdfUrl] = useState("");
   const pdfUrlRef = useRef("");
 
-  // ---- Refs para evitar reiniciar reconocimiento ----
+  // ---- Refs ----
   const recognitionRef = useRef(null);
-  const shouldListenRef = useRef(false); // mantiene el dictado activo (reintenta si Chrome lo corta)
+  const shouldListenRef = useRef(false);
 
   const modeRef = useRef(mode);
   const activeSectionRef = useRef(activeSection);
@@ -246,7 +420,7 @@ export default function App() {
     if (aiTimerRef.current) clearTimeout(aiTimerRef.current);
     aiTimerRef.current = setTimeout(() => {
       flushAI();
-    }, 900);
+    }, 700);
   };
 
   const flushAI = async () => {
@@ -260,8 +434,8 @@ export default function App() {
     setAiStatus("analyzing");
     setAiError("");
 
-    const ctxTimeline = (timelineRef.current || []).slice(-20).map((t) => t.text).join(" ");
-    const ctxTranscript = safeTrim(transcriptRef.current || "").slice(-4000);
+    const ctxTimeline = (timelineRef.current || []).slice(-25).map((t) => t.text).join(" ");
+    const ctxTranscript = safeTrim(transcriptRef.current || "").slice(-5000);
     const delta = batch.join(" ");
     pendingTextRef.current = [];
 
@@ -332,7 +506,7 @@ export default function App() {
       } catch {
         // ignore
       }
-    }, 900);
+    }, 700);
 
     return () => clearTimeout(t);
   }, [pdfPreview, effectiveReport]);
@@ -398,7 +572,7 @@ export default function App() {
       } catch {
         // ignore
       }
-    }, 350);
+    }, 250);
 
     return () => clearTimeout(t);
   }, [
@@ -452,27 +626,36 @@ export default function App() {
 
       const stamp = new Date().toLocaleTimeString("es-GT");
 
-      // Autosección por encabezado
-      let target = activeSectionRef.current;
-      let toInsert = finalRaw;
+      // Siempre guardamos transcripción completa
+      setFullTranscript((prev) => safeTrim(`${prev} ${finalRaw}`));
 
-      if (autoSectionRef.current) {
+      // Timeline
+      setTimeline((prev) => [
+        ...prev,
+        {
+          ts: stamp,
+          section: modeRef.current === "section" ? activeSectionRef.current : "(libre)",
+          text: finalRaw,
+        },
+      ]);
+
+      // Auto-sección (solo setea activeSection; la distribución la hace smartDistributeText)
+      if (modeRef.current === "section" && autoSectionRef.current) {
         const d = detectSectionHeader(finalRaw);
-        if (d.key) {
-          target = d.key;
-          toInsert = d.cleaned || "";
-          setActiveSection(d.key);
-        }
+        if (d.key) setActiveSection(d.key);
       }
 
-      setTimeline((prev) => [...prev, { ts: stamp, section: modeRef.current === "section" ? target : "(libre)", text: finalRaw }]);
+      const fallbackKey = modeRef.current === "section" ? activeSectionRef.current : "impresion";
 
-      if (modeRef.current === "section") {
-        setSections((prev) => ({ ...prev, [target]: safeTrim(`${prev[target]} ${toInsert}`) }));
-      } else {
-        setFullTranscript((prev) => safeTrim(`${prev} ${finalRaw}`));
+      // Distribución local (para NO dejar todo en un solo campo)
+      setSections((prev) => smartDistributeText(prev, finalRaw, fallbackKey).next);
+
+      // UI: si IA está activa, también actualiza aiSections inmediatamente (luego backend lo mejora)
+      if (aiEnabledRef.current) {
+        setAiSections((prev) => smartDistributeText(prev, finalRaw, fallbackKey).next);
       }
 
+      // Backend IA (opcional)
       enqueueAI(finalRaw);
     };
 
@@ -480,7 +663,6 @@ export default function App() {
       const msg = e?.error ? String(e.error) : "Error desconocido";
       setPermissionError(msg);
 
-      // Algunos errores son “normales” en SpeechRecognition y conviene reintentar
       const transient = ["no-speech", "aborted", "audio-capture", "network"];
       if (shouldListenRef.current && transient.includes(msg)) {
         try { recognitionRef.current?.stop(); } catch {}
@@ -504,8 +686,6 @@ export default function App() {
       setIsListening(false);
       setInterim("");
 
-      // Chrome a veces corta el reconocimiento aunque sea continuous.
-      // Si el usuario no lo detuvo, reintentamos.
       if (shouldListenRef.current) {
         setTimeout(() => {
           if (!shouldListenRef.current) return;
@@ -559,11 +739,11 @@ export default function App() {
     if (!ok) return;
 
     shouldListenRef.current = true;
+
     try {
       recognitionRef.current?.start();
       setIsListening(true);
     } catch (e) {
-      // A veces tira InvalidStateError si quedó “medio vivo”
       try { recognitionRef.current?.stop(); } catch {}
       setTimeout(() => {
         if (!shouldListenRef.current) return;
@@ -608,10 +788,6 @@ export default function App() {
     }
   };
 
-  const applyAIToManual = () => {
-    setSections((p) => ({ ...p, ...aiSections }));
-  };
-
   const copyToClipboard = async (text) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -626,7 +802,14 @@ export default function App() {
   };
 
   const exportPDF = () => {
-    exportTextToPDF(effectiveReport, aiEnabled ? "informe_clinote_IA" : "informe_clinote");
+    exportTextToPDF(effectiveReport, aiEnabled ? "APROFAM_ClinNote_IA" : "APROFAM_ClinNote");
+  };
+
+  // UI source: si IA está activa, editás sobre la estructura IA
+  const uiSections = aiEnabled ? aiSections : sections;
+  const setUiSectionValue = (key, value) => {
+    if (aiEnabled) setAiSections((p) => ({ ...p, [key]: value }));
+    else setSections((p) => ({ ...p, [key]: value }));
   };
 
   // ---- Neumorphism ----
@@ -649,9 +832,7 @@ export default function App() {
         <header className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight text-slate-800">APROFAM ClinNote</h1>
-            <p className="text-sm text-slate-600">
-              Aplicación para tomar notas clínicas.
-            </p>
+            <p className="text-sm text-slate-600">Aplicación para tomar notas clínicas.</p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -676,7 +857,7 @@ export default function App() {
             <div className="font-semibold">Error IA</div>
             <div className="mt-1 break-words">{aiError || "Error desconocido"}</div>
             <div className="mt-2 text-xs text-slate-700">
-              Asegurate de tener el backend levantado en <code>/api/clinote/analyze</code>.
+              Si estás en local (Vite) sin Vercel, podés desactivar “Analizar con IA (backend)” y usar solo la heurística local.
             </div>
           </div>
         )}
@@ -720,7 +901,9 @@ export default function App() {
                         ))}
                       </select>
                     </div>
-                    <p className="mt-2 text-xs text-slate-500">Tip: dictá “Diagnóstico: …” y se cambia solo.</p>
+                    <p className="mt-2 text-xs text-slate-500">
+                      Tip: podés dictar “Diagnóstico: …” o “Receta: …” y se ordena solo.
+                    </p>
                   </div>
                 )}
 
@@ -791,14 +974,6 @@ export default function App() {
                     <span className="text-sm text-slate-700">Vista previa PDF (auto)</span>
                   </label>
                 </div>
-
-                <button
-                  onClick={applyAIToManual}
-                  disabled={!aiEnabled}
-                  className={cn("rounded-xl px-3 py-2 text-sm font-semibold text-slate-800", BTN, !aiEnabled ? "opacity-60 cursor-not-allowed" : "")}
-                >
-                  Aplicar IA a nota manual
-                </button>
               </div>
             </div>
 
@@ -844,22 +1019,39 @@ export default function App() {
           {/* Panel derecho */}
           <div className="lg:col-span-8">
             <div className={cn("rounded-2xl p-4", CARD)}>
-              <h2 className="text-sm font-semibold text-slate-700">Nota clínica (manual)</h2>
+              <h2 className="text-sm font-semibold text-slate-700">
+                Nota clínica ({aiEnabled ? "IA" : "manual"})
+              </h2>
+
               <div className="mt-4 grid gap-3">
                 {SECTION_DEFS.map((s) => (
-                  <div key={s.key} className={cn("rounded-2xl p-3", INSET, activeSection === s.key && mode === "section" ? "outline outline-2 outline-slate-700" : "")}>
+                  <div
+                    key={s.key}
+                    className={cn(
+                      "rounded-2xl p-3",
+                      INSET,
+                      activeSection === s.key && mode === "section" ? "outline outline-2 outline-slate-700" : ""
+                    )}
+                  >
                     <div className="flex items-center justify-between gap-3">
                       <div className="text-sm font-semibold text-slate-800">{s.label}</div>
                       {mode === "section" && (
-                        <button onClick={() => setActiveSection(s.key)} className={cn("rounded-full px-3 py-1 text-xs font-semibold", BTN, activeSection === s.key ? BTN_PRIMARY : "text-slate-800")}>
+                        <button
+                          onClick={() => setActiveSection(s.key)}
+                          className={cn(
+                            "rounded-full px-3 py-1 text-xs font-semibold",
+                            BTN,
+                            activeSection === s.key ? BTN_PRIMARY : "text-slate-800"
+                          )}
+                        >
                           {activeSection === s.key ? "Activa" : "Activar"}
                         </button>
                       )}
                     </div>
 
                     <textarea
-                      value={sections[s.key]}
-                      onChange={(e) => setSections((p) => ({ ...p, [s.key]: e.target.value }))}
+                      value={uiSections[s.key]}
+                      onChange={(e) => setUiSectionValue(s.key, e.target.value)}
                       rows={s.key === "motivo" ? 3 : 4}
                       className="mt-2 w-full resize-y rounded-xl bg-transparent px-2 py-2 text-sm text-slate-800 outline-none placeholder:text-slate-500"
                       placeholder={`Escribí o dictá aquí: ${s.label}`}
@@ -873,7 +1065,12 @@ export default function App() {
               <div className={cn("rounded-2xl p-4", CARD)}>
                 <h2 className="text-sm font-semibold text-slate-700">Transcripción</h2>
                 <div className={cn("mt-3 rounded-xl p-3", INSET)}>
-                  <textarea value={fullTranscript} onChange={(e) => setFullTranscript(e.target.value)} rows={10} className="w-full resize-y bg-transparent text-sm text-slate-800 outline-none placeholder:text-slate-500" />
+                  <textarea
+                    value={fullTranscript}
+                    onChange={(e) => setFullTranscript(e.target.value)}
+                    rows={10}
+                    className="w-full resize-y bg-transparent text-sm text-slate-800 outline-none placeholder:text-slate-500"
+                  />
                 </div>
               </div>
 
@@ -918,9 +1115,6 @@ export default function App() {
                       <li key={`${item.ts}-${idx}`} className={cn("rounded-xl p-3", BG, "shadow-[4px_4px_10px_rgba(163,177,198,0.35),-4px_-4px_10px_rgba(255,255,255,0.75)]")}>
                         <div className="flex flex-wrap items-center gap-2">
                           <span className={cn("rounded-full px-2 py-0.5 text-xs font-semibold text-slate-700", INSET)}>{item.ts}</span>
-                          <span className={cn("rounded-full px-2 py-0.5 text-xs font-semibold text-slate-700", INSET)}>
-                            {SECTION_DEFS.find((s) => s.key === item.section)?.label || item.section}
-                          </span>
                         </div>
                         <div className="mt-1 text-sm text-slate-800">{item.text}</div>
                       </li>
@@ -931,11 +1125,11 @@ export default function App() {
             </div>
 
             <div className={cn("mt-4 rounded-2xl p-4 text-sm text-slate-700", CARD)}>
-              <div className="font-semibold">Nota rápida</div>
+              <div className="font-semibold">Mejora aplicada</div>
               <ul className="mt-2 list-disc space-y-1 pl-5">
-                <li>El navegador transcribe. El backend solo recibe <b>texto</b> para análisis IA.</li>
-                <li>El PDF en preview no se “descarga”; para guardar el archivo usá <b>Descargar PDF</b>.</li>
-                <li>IA usa <code>delta_text</code> + contexto recortado; así va “armando” el informe.</li>
+                <li>Ahora el texto se distribuye automáticamente entre <b>Diagnóstico</b>, <b>Receta</b>, <b>Motivo</b>, etc. (aunque no digas “Diagnóstico:”).</li>
+                <li>Si en una frase viene “tratamiento…” y luego “diagnóstico…”, se separa.</li>
+                <li>La transcripción completa se guarda siempre (sirve para el PDF).</li>
               </ul>
             </div>
           </div>

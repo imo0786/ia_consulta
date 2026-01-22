@@ -15,3 +15,5 @@ Abrí: http://localhost:5173
 - Output Directory: `dist`
 
 Incluye una función de ejemplo en `/api/clinote/analyze` (heurística) para que el modo IA no falle aunque no uses OpenAI.
+
+✅ Mejora: distribución automática de texto a Diagnóstico/Receta/Motivo/Signos.
