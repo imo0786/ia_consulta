@@ -3,8 +3,12 @@
  * Heurística (sin OpenAI) para que el modo IA no falle:
  * - Detecta encabezados tipo "Diagnóstico: ..." y actualiza secciones.
  * - Si no detecta, agrega el texto al campo más probable según palabras clave.
+ *
+ * IMPORTANTE:
+ * - Este repo usa package.json con "type":"module" => este archivo debe ser ESM.
+ * - Por eso exportamos con `export default`.
  */
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   try {
     if (req.method !== "POST") {
       res.statusCode = 405;
@@ -25,7 +29,7 @@ module.exports = async (req, res) => {
       return res.end(JSON.stringify({ sections, alerts, questions }));
     }
 
-    function safeTrim(s){ return String(s||"").replace(/\s+/g," ").trim(); }
+    const safeTrim = (s) => String(s || "").replace(/\s+/g, " ").trim();
 
     const headers = [
       { key: "motivo", re: /^(motivo(\s+de(\s+la)?)?\s+(consulta|la\s+consulta|de\s+consulta)?)(\s*[:\-])\s*/i },
@@ -72,4 +76,4 @@ module.exports = async (req, res) => {
     res.statusCode = 500;
     res.end(String(e && e.message ? e.message : e));
   }
-};
+}

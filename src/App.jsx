@@ -205,6 +205,7 @@ export default function App() {
 
   // ---- Refs para evitar reiniciar reconocimiento ----
   const recognitionRef = useRef(null);
+  const shouldListenRef = useRef(false); // mantiene el dictado activo (reintenta si Chrome lo corta)
 
   const modeRef = useRef(mode);
   const activeSectionRef = useRef(activeSection);
@@ -478,12 +479,44 @@ export default function App() {
     rec.onerror = (e) => {
       const msg = e?.error ? String(e.error) : "Error desconocido";
       setPermissionError(msg);
+
+      // Algunos errores son “normales” en SpeechRecognition y conviene reintentar
+      const transient = ["no-speech", "aborted", "audio-capture", "network"];
+      if (shouldListenRef.current && transient.includes(msg)) {
+        try { recognitionRef.current?.stop(); } catch {}
+        setTimeout(() => {
+          if (!shouldListenRef.current) return;
+          try {
+            recognitionRef.current?.start();
+            setIsListening(true);
+          } catch {
+            setIsListening(false);
+          }
+        }, 450);
+        return;
+      }
+
+      shouldListenRef.current = false;
       setIsListening(false);
     };
 
     rec.onend = () => {
       setIsListening(false);
       setInterim("");
+
+      // Chrome a veces corta el reconocimiento aunque sea continuous.
+      // Si el usuario no lo detuvo, reintentamos.
+      if (shouldListenRef.current) {
+        setTimeout(() => {
+          if (!shouldListenRef.current) return;
+          try {
+            recognitionRef.current?.start();
+            setIsListening(true);
+          } catch {
+            // ignore
+          }
+        }, 250);
+      }
     };
 
     recognitionRef.current = rec;
@@ -525,16 +558,29 @@ export default function App() {
     const ok = await requestMicPermission();
     if (!ok) return;
 
+    shouldListenRef.current = true;
     try {
       recognitionRef.current?.start();
       setIsListening(true);
-    } catch {
-      setPermissionError("No se pudo iniciar el dictado. Si ya estaba activo, detenelo y volvé a intentar.");
-      setIsListening(false);
+    } catch (e) {
+      // A veces tira InvalidStateError si quedó “medio vivo”
+      try { recognitionRef.current?.stop(); } catch {}
+      setTimeout(() => {
+        if (!shouldListenRef.current) return;
+        try {
+          recognitionRef.current?.start();
+          setIsListening(true);
+        } catch {
+          setPermissionError("No se pudo iniciar el dictado. Probá recargar la página.");
+          shouldListenRef.current = false;
+          setIsListening(false);
+        }
+      }, 250);
     }
   };
 
   const stop = () => {
+    shouldListenRef.current = false;
     try { recognitionRef.current?.stop(); } catch {}
     setIsListening(false);
     setInterim("");
