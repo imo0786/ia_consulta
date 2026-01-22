@@ -1,4 +1,4 @@
-# ClinNote (Vite + React)
+# APROFAM ClinNote (Vite + React)
 
 ## Local
 ```bash

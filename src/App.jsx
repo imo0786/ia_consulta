@@ -602,9 +602,9 @@ export default function App() {
       <div className="mx-auto max-w-6xl p-4 sm:p-6">
         <header className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight text-slate-800">ClinNote</h1>
+            <h1 className="text-2xl font-semibold tracking-tight text-slate-800">APROFAM ClinNote</h1>
             <p className="text-sm text-slate-600">
-              Dictado + nota clínica. IA analiza el texto y arma el informe y el PDF en tiempo real.
+              Aplicación para tomar notas clínicas.
             </p>
           </div>
 
