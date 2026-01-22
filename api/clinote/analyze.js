@@ -38,19 +38,66 @@ function detectHeader(t) {
   return { key: null, cleaned: text };
 }
 
+function digitsOnly(s) {
+  return String(s || "").replace(/[^\d]/g, "");
+}
+
+function formatDpi(raw) {
+  const d = digitsOnly(raw);
+  if (!d) return "";
+  if (d.length === 13) return `${d.slice(0, 4)} ${d.slice(4, 9)} ${d.slice(9)}`;
+  return d;
+}
+
+function extractPatient(text) {
+  const t = String(text || "");
+  const out = {};
+
+  const mName = t.match(/\b(?:paciente\s+)?(?:se\s+llama|nombre\s+del\s+paciente\s+es|nombre\s+es)\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})/i);
+  if (mName) out.name = safeTrim(mName[1]);
+
+  const mAge = t.match(/\btiene\s+(\d{1,3})\s*a(?:ñ|n)os?\b/i);
+  if (mAge) out.age = safeTrim(mAge[1]);
+
+  const mSex = t.match(/\bsexo\s*(?:es|:)?\s*(masculino|femenino|hombre|mujer)\b/i);
+  if (mSex) {
+    const v = mSex[1].toLowerCase();
+    out.sex = v === "hombre" ? "Masculino" : v === "mujer" ? "Femenino" : v.charAt(0).toUpperCase() + v.slice(1);
+  }
+
+  const mDpi = t.match(/\b(?:dpi|documento\s+personal\s+de\s+identificaci[oó]n)\b\s*(?:es|:|n[uú]mero\s+es|n[uú]mero\s+de\s+)?\s*([\d\s\-]{10,})/i);
+  if (mDpi) out.dpi = formatDpi(mDpi[1]);
+
+  const mPhone = t.match(/\b(?:tel[eé]fono|celular)\b\s*(?:es|:)?\s*([\d\s\-]{8,})/i);
+  if (mPhone) out.phone = safeTrim(mPhone[1]);
+
+  const mRec = t.match(/\b(?:expediente|no\.\s*expediente|n[uú]mero\s+de\s+expediente)\b\s*(?:es|:)?\s*([\w\-]{3,})/i);
+  if (mRec) out.record = safeTrim(mRec[1]);
+
+  return out;
+}
+
 function extractVitals(text) {
-  const t = text;
+  const t = String(text || "");
   const out = [];
-  const pa = t.match(/\b(PA|TA)\s*(\d{2,3})\s*[\/\-]\s*(\d{2,3})\b/i);
-  if (pa) out.push(`PA: ${pa[2]}/${pa[3]}`);
-  const fc = t.match(/\b(FC|pulso)\s*(\d{2,3})\b/i);
-  if (fc) out.push(`FC: ${fc[2]}`);
-  const fr = t.match(/\b(FR)\s*(\d{1,2})\b/i);
-  if (fr) out.push(`FR: ${fr[2]}`);
-  const temp = t.match(/\b(temp(?:eratura)?)\s*(\d{2}(?:\.\d)?)\b/i);
-  if (temp) out.push(`Temp: ${temp[1] ? temp[1] : temp[2]}°C`.replace("undefined", temp[2]));
-  const sat = t.match(/\b(sat(?:uraci[oó]n)?\s*o2|spo2)\s*(\d{2,3})\b/i);
-  if (sat) out.push(`SatO2: ${sat[2]}%`);
+
+  const mTemp = t.match(/\btemperatura\b(?:\s*(?:est[aá]\s*en|est[aá]|en|:))?\s*(\d{2}(?:[.,]\d)?)\b/i);
+  if (mTemp) out.push(`Temp: ${mTemp[1].replace(",", ".")}°C`);
+
+  const mBP =
+    t.match(/\bpresi[oó]n\b(?:\s*(?:arterial)?)?(?:\s*(?:est[aá]\s*en|en|:))?\s*(\d{2,3})\s*(?:\/|\s|\-)\s*(\d{2,3})\b/i) ||
+    t.match(/\b(?:PA|TA)\b\s*(\d{2,3})\s*(?:\/|\s|\-)\s*(\d{2,3})\b/i);
+  if (mBP) out.push(`PA: ${mBP[1]}/${mBP[2]}`);
+
+  const mFC = t.match(/\b(?:frecuencia\s+card[ií]aca|FC|pulso)\b(?:\s*(?:en|:|est[aá]\s*en))?\s*(\d{2,3})\b/i);
+  if (mFC) out.push(`FC: ${mFC[1]}`);
+
+  const mFR = t.match(/\b(?:frecuencia\s+respiratoria|FR)\b(?:\s*(?:en|:|est[aá]\s*en))?\s*(\d{1,2})\b/i);
+  if (mFR) out.push(`FR: ${mFR[1]}`);
+
+  const mSat = t.match(/\b(?:sat(?:uraci[oó]n)?\s*o2|spo2)\b(?:\s*(?:en|:|est[aá]\s*en))?\s*(\d{2,3})\b/i);
+  if (mSat) out.push(`SatO2: ${mSat[1]}%`);
+
   return out.length ? out.join(" · ") : "";
 }
 
@@ -98,11 +145,19 @@ module.exports = async (req, res) => {
     const current = body?.current?.sections || {};
 
     const sections = { ...current };
+
+    // Auto-extracción de datos del paciente desde el texto (delta + contexto)
+    const ctxText = safeTrim(
+      `${delta} ${body?.input?.timeline_context || ""} ${body?.input?.transcript_context || ""}`
+    );
+    const patient = extractPatient(ctxText);
+
+
     const alerts = Array.isArray(body?.current?.alerts) ? body.current.alerts.slice(0, 20) : [];
     const questions = Array.isArray(body?.current?.questions) ? body.current.questions.slice(0, 20) : [];
 
     if (!delta) {
-      res.status(200).json({ sections, alerts, questions });
+      res.status(200).json({ sections, alerts, questions, patient });
       return;
     }
 
@@ -143,7 +198,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    res.status(200).json({ sections, alerts, questions });
+    res.status(200).json({ sections, alerts, questions, patient });
   } catch (err) {
     res.status(500).json({ error: String(err?.message || err) });
   }

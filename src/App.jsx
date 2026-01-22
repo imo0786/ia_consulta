@@ -305,6 +305,171 @@ function detectSectionHeader(text) {
   return { key: null, cleaned: t };
 }
 
+
+
+// --------------------
+// Auto-extracción (reglas locales) para llenar campos aunque el dictado venga "en párrafo".
+// *No reemplaza al médico*: solo organiza lo que ya se dijo.
+
+function mergeText(oldTxt, newTxt) {
+  const a = safeTrim(oldTxt);
+  const b = safeTrim(newTxt);
+  if (!b) return a;
+  if (!a) return b;
+  if (a.toLowerCase().includes(b.toLowerCase())) return a;
+  return `${a} ${b}`.trim();
+}
+
+function digitsOnly(s) {
+  return String(s || "").replace(/[^\d]/g, "");
+}
+
+function formatDpi(raw) {
+  const d = digitsOnly(raw);
+  if (!d) return "";
+  // Formato común GT: 4-5-4 (13 dígitos) => 1234 56789 0101
+  if (d.length === 13) return `${d.slice(0, 4)} ${d.slice(4, 9)} ${d.slice(9)}`;
+  return d;
+}
+
+function extractPatientPatch(text) {
+  const t = String(text || "");
+  const out = {};
+
+  // Nombre
+  const mName =
+    t.match(/\b(?:paciente\s+)?(?:se\s+llama|nombre\s+del\s+paciente\s+es|nombre\s+es)\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})/i);
+  if (mName) out.name = safeTrim(mName[1]);
+
+  // Edad
+  const mAge = t.match(/\btiene\s+(\d{1,3})\s*a(?:ñ|n)os?\b/i);
+  if (mAge) out.age = safeTrim(mAge[1]);
+
+  // Sexo
+  const mSex = t.match(/\bsexo\s*(?:es|:)?\s*(masculino|femenino|hombre|mujer)\b/i);
+  if (mSex) {
+    const v = mSex[1].toLowerCase();
+    out.sex = v === "hombre" ? "Masculino" : v === "mujer" ? "Femenino" : v.charAt(0).toUpperCase() + v.slice(1);
+  }
+
+  // DPI
+  const mDpi =
+    t.match(/\b(?:dpi|documento\s+personal\s+de\s+identificaci[oó]n)\b\s*(?:es|:|n[uú]mero\s+es|n[uú]mero\s+de\s+)?\s*([\d\s\-]{10,})/i);
+  if (mDpi) out.dpi = formatDpi(mDpi[1]);
+
+  // Teléfono
+  const mPhone = t.match(/\b(?:tel[eé]fono|celular)\b\s*(?:es|:)?\s*([\d\s\-]{8,})/i);
+  if (mPhone) out.phone = safeTrim(mPhone[1]);
+
+  // Expediente
+  const mRec = t.match(/\b(?:expediente|no\.\s*expediente|n[uú]mero\s+de\s+expediente)\b\s*(?:es|:)?\s*([\w\-]{3,})/i);
+  if (mRec) out.record = safeTrim(mRec[1]);
+
+  return out;
+}
+
+function extractVitalsFromText(text) {
+  const t = String(text || "");
+  const out = [];
+
+  const mTemp = t.match(/\btemperatura\b(?:\s*(?:est[aá]\s*en|:))?\s*(\d{2}(?:[.,]\d)?)\b/i);
+  if (mTemp) out.push(`Temp: ${mTemp[1].replace(",", ".")}°C`);
+
+  const mBP =
+    t.match(/\bpresi[oó]n\b(?:\s*(?:arterial)?)?(?:\s*(?:est[aá]\s*en|:))?\s*(\d{2,3})\s*(?:\/|\s)\s*(\d{2,3})\b/i) ||
+    t.match(/\b(?:pa|ta)\b\s*(\d{2,3})\s*(?:\/|\s)\s*(\d{2,3})\b/i);
+  if (mBP) out.push(`PA: ${mBP[1]}/${mBP[2]}`);
+
+  const mFC =
+    t.match(/\b(?:frecuencia\s+card[ií]aca|fc|pulso)\b(?:\s*(?:en|:|est[aá]\s*en))?\s*(\d{2,3})\b/i);
+  if (mFC) out.push(`FC: ${mFC[1]}`);
+
+  const mFR = t.match(/\b(?:frecuencia\s+respiratoria|fr)\b(?:\s*(?:en|:|est[aá]\s*en))?\s*(\d{1,2})\b/i);
+  if (mFR) out.push(`FR: ${mFR[1]}`);
+
+  const mSat = t.match(/\b(?:sat(?:uraci[oó]n)?\s*o2|spo2)\b(?:\s*(?:en|:|est[aá]\s*en))?\s*(\d{2,3})\b/i);
+  if (mSat) out.push(`SatO2: ${mSat[1]}%`);
+
+  return out.length ? out.join(" · ") : "";
+}
+
+function extractPrescriptionFromText(text) {
+  const t = String(text || "");
+  // Capturar desde "se receta / se prescribe / se indica" hasta antes de plan/seguimiento
+  const m = t.match(/\b(?:se\s+recet[aá]|se\s+prescribe|se\s+indica|se\s+deja)\b\s*(.+?)(?=(?:\bplan\b|\bseguimiento\b|\bregrese\b|\bcita\b|$))/i);
+  if (!m) return "";
+  const chunk = safeTrim(m[1]);
+
+  // Separar por " y " si parece lista de medicamentos
+  const parts = chunk.split(/\s+y\s+/i).map(safeTrim).filter(Boolean);
+  if (parts.length >= 2) return parts.map((p) => (p.startsWith("-") ? p : `- ${p}`)).join("\n");
+  return chunk;
+}
+
+function extractSectionSnippets(text) {
+  const t = safeTrim(text);
+  const sectionsPatch = {};
+  let matched = false;
+
+  // Motivo
+  const mm = t.match(/\bmotivo\s+de\s+la?\s*consulta\b\s*(?:es|:)?\s*(?:porque\s*)?(.+?)(?=(?:\bantecedentes\b|\brevisi[oó]n\b|\bsignos\b|\bimpresi[oó]n\b|\bdiagn[oó]stico\b|\bse\s+recet|\bprescripci[oó]n\b|\bplan\b|\bseguimiento\b|$))/i);
+  if (mm) { sectionsPatch.motivo = safeTrim(mm[1]); matched = true; }
+
+  // Antecedentes
+  const ma = t.match(/\bantecedentes\b\s*(?:son|:)?\s*(.+?)(?=(?:\brevisi[oó]n\b|\bsignos\b|\bimpresi[oó]n\b|\bdiagn[oó]stico\b|\bse\s+recet|\bprescripci[oó]n\b|\bplan\b|\bseguimiento\b|$))/i);
+  if (ma) { sectionsPatch.antecedentes = safeTrim(ma[1]); matched = true; }
+
+  // Signos vitales
+  const vit = extractVitalsFromText(t);
+  if (vit) { sectionsPatch.signos = vit; matched = true; }
+
+  // Impresión clínica
+  const mi =
+    t.match(/\bimpresi[oó]n\s+cl[ií]nica\b\s*(?:es|:)?\s*(.+?)(?=(?:\bdiagn[oó]stico\b|\bse\s+recet|\bprescripci[oó]n\b|\bplan\b|\bseguimiento\b|$))/i) ||
+    t.match(/\baparentemente\s+se\s+trata\s+de\s+(.+?)(?=(?:\bdiagn[oó]stico\b|\bse\s+recet|\bprescripci[oó]n\b|\bplan\b|\bseguimiento\b|$))/i);
+  if (mi) { sectionsPatch.impresion = safeTrim(mi[1]); matched = true; }
+
+  // Diagnóstico
+  const md = t.match(/\bdiagn[oó]stico\b\s*(?:es|:|ser[ií]a|principal\s+es)\s*(.+?)(?=(?:\bse\s+recet|\bprescripci[oó]n\b|\bplan\b|\bseguimiento\b|$))/i);
+  if (md) { sectionsPatch.diagnostico = safeTrim(md[1]); matched = true; }
+
+  // Prescripción
+  const rx = extractPrescriptionFromText(t);
+  if (rx) { sectionsPatch.prescripcion = rx; matched = true; }
+
+  // Plan / seguimiento
+  const mp = t.match(/\b(?:plan\s+de\s+seguimiento|plan|seguimiento|indicaciones|se\s+necesita\s+que\s+regrese|regrese|cita\s+de\s+control)\b[\s:,-]*(.+)$/i);
+  if (mp) {
+    const planTxt = safeTrim(mp[1]);
+    // Evitar repetir si es literalmente lo mismo que rx
+    if (planTxt && !safeTrim(rx).toLowerCase().includes(planTxt.toLowerCase())) {
+      sectionsPatch.plan = planTxt;
+      matched = true;
+    }
+  }
+
+  return { matched, sectionsPatch };
+}
+
+function mergeSections(prev, patch) {
+  const next = { ...prev };
+  for (const k of Object.keys(patch || {})) {
+    next[k] = mergeText(next[k], patch[k]);
+  }
+  return next;
+}
+
+function mergePatient(prev, patch) {
+  const next = { ...prev };
+  for (const k of Object.keys(patch || {})) {
+    const v = safeTrim(patch[k]);
+    if (!v) continue;
+    // No sobre-escribimos si ya hay valor (evita "borrar" con ruido)
+    if (!safeTrim(next[k])) next[k] = v;
+  }
+  return next;
+}
+
 // --------------------
 // Sugerencias CIE-10 (reglas simples)
 const ICD10_RULES = [
@@ -498,27 +663,61 @@ export default function App() {
       setInterim(interimTxt);
       if (!finalRaw) return;
 
+
       const stamp = new Date().toLocaleTimeString("es-GT");
 
-      let target = activeSectionRef.current;
-      let toInsert = finalRaw;
+      // Encabezado explícito al inicio (ej. "Diagnóstico: ...") => cambia sección activa
+      const header = autoSectionRef.current ? detectSectionHeader(finalRaw) : { key: null, cleaned: finalRaw };
+      if (header.key) setActiveSection(header.key);
+
+      // Siempre guardamos transcripción completa (aunque estemos en modo "Por secciones")
+      setFullTranscript((prev) => safeTrim(`${prev} ${finalRaw}`));
+
+      // Auto-extracción por reglas (sin depender de encabezados)
+      let autoMatched = false;
 
       if (autoSectionRef.current) {
-        const d = detectSectionHeader(finalRaw);
-        if (d.key) {
-          target = d.key;
-          toInsert = d.cleaned || "";
-          setActiveSection(d.key);
+        const pPatch = extractPatientPatch(finalRaw);
+        if (pPatch && Object.keys(pPatch).length) {
+          autoMatched = true;
+          setPatient((prev) => mergePatient(prev, pPatch));
+        }
+
+        // Si hay encabezado, lo que sigue al ":" se agrega a esa sección directamente
+        if (header.key && safeTrim(header.cleaned)) {
+          autoMatched = true;
+          setSections((prev) => mergeSections(prev, { [header.key]: header.cleaned }));
+        }
+
+        const { matched, sectionsPatch } = extractSectionSnippets(finalRaw);
+        if (matched && sectionsPatch && Object.keys(sectionsPatch).length) {
+          autoMatched = true;
+          setSections((prev) => mergeSections(prev, sectionsPatch));
         }
       }
 
-      setTimeline((prev) => [...prev, { ts: stamp, section: modeRef.current === "section" ? target : "(libre)", text: finalRaw }]);
+      // Timeline (si hubo encabezado explícito, lo mostramos)
+      const tlSection =
+        modeRef.current === "section"
+          ? (header.key || activeSectionRef.current)
+          : "(libre)";
+      setTimeline((prev) => [...prev, { ts: stamp, section: tlSection, text: finalRaw }]);
 
-      if (modeRef.current === "section") {
-        setSections((prev) => ({ ...prev, [target]: safeTrim(`${prev[target]} ${toInsert}`) }));
-      } else {
-        setFullTranscript((prev) => safeTrim(`${prev} ${finalRaw}`));
+      // Fallback: si NO se pudo clasificar nada, insertamos en la sección activa actual
+      if (modeRef.current === "section" && !autoMatched) {
+        let target = activeSectionRef.current;
+        let toInsert = finalRaw;
+
+        if (autoSectionRef.current && header.key) {
+          target = header.key;
+          toInsert = header.cleaned || "";
+        }
+
+        if (safeTrim(toInsert)) {
+          setSections((prev) => ({ ...prev, [target]: safeTrim(`${prev[target]} ${toInsert}`) }));
+        }
       }
+
 
       // Sugerencias CIE-10 por texto (se acumulan, no se insertan solas)
       setIcd10Suggestions((prev) => {
@@ -699,6 +898,7 @@ export default function App() {
     setInterim("");
     setTimeline([]);
     setIcd10Suggestions([]);
+    setPatient({ name: "", age: "", sex: "", dpi: "", phone: "", record: "" });
     try { if (mp3Url) URL.revokeObjectURL(mp3Url); } catch {}
     setMp3Url("");
     setMp3Info({ filename: "", size: 0 });
