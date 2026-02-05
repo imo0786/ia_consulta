@@ -25,6 +25,7 @@ const DEFAULT_SECTIONS = SECTION_DEFS.reduce((acc, s) => {
 }, {});
 
 const STORAGE_KEY = "apro_clinnote_state_v1";
+const PATIENTS_KEY = "apro_clinnote_patients_v1";
 
 function cn(...cls) {
   return cls.filter(Boolean).join(" ");
@@ -68,6 +69,29 @@ function buildConclusion(sections) {
   if (plan) parts.push(`Plan/Indicaciones: ${plan}.`);
 
   return parts.length ? parts.join(" ") : "(Pendiente de completar información clínica)";
+}
+
+function buildSuggestionSummary(sections, suggestions) {
+  const dx = safeTrim(sections?.diagnostico);
+  const motivo = safeTrim(sections?.motivo);
+  const sugText = (suggestions || [])
+    .slice(0, 3)
+    .map((s) => `${s.code} ${s.title}`)
+    .join(", ");
+
+  if (dx && sugText) {
+    return `Según lo descrito, se sugiere revisar: ${sugText}. Diagnóstico registrado: ${dx}.`;
+  }
+  if (dx) {
+    return `Diagnóstico registrado: ${dx}.`;
+  }
+  if (motivo && sugText) {
+    return `Según el motivo de consulta, se sugiere revisar: ${sugText}.`;
+  }
+  if (sugText) {
+    return `Sugerencias preliminares: ${sugText}.`;
+  }
+  return "(Sin sugerencias automáticas todavía)";
 }
 
 function wrapText(doc, text, x, y, maxW, lineH) {
@@ -247,6 +271,15 @@ function buildBrandedPdf({ meta, patient, clinician, site, sections, transcript,
     margin,
     cursorY: y,
     brandBar: C_DARK,
+  });
+
+  // Sugerencia automática (referencia)
+  y = addSection(doc, "SUGERENCIA AUTOMÁTICA (REFERENCIA)", buildSuggestionSummary(sections || {}, suggestions || []), {
+    pageW,
+    pageH,
+    margin,
+    cursorY: y,
+    brandBar: "#475569",
   });
 
   // Transcripción
@@ -571,6 +604,8 @@ export default function App() {
   const [sections, setSections] = useState({ ...DEFAULT_SECTIONS });
   const [fullTranscript, setFullTranscript] = useState("");
   const [timeline, setTimeline] = useState([]);
+  const [patientRegistry, setPatientRegistry] = useState([]);
+  const [registryNotice, setRegistryNotice] = useState("");
 
   // Sugerencias
   const [icd10Suggestions, setIcd10Suggestions] = useState([]);
@@ -609,6 +644,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    try {
+      const raw = localStorage.getItem(PATIENTS_KEY);
+      if (!raw) return;
+      const s = JSON.parse(raw);
+      if (Array.isArray(s)) setPatientRegistry(s);
+    } catch {}
+  }, []);
+
+  useEffect(() => {
     if (!persistLocal) return;
     const t = setTimeout(() => {
       try {
@@ -632,6 +676,16 @@ export default function App() {
     }, 300);
     return () => clearTimeout(t);
   }, [meta, patient, sections, fullTranscript, timeline, mode, activeSection, autoSection, persistLocal, pdfPreview]);
+
+  useEffect(() => {
+    if (!persistLocal) return;
+    const t = setTimeout(() => {
+      try {
+        localStorage.setItem(PATIENTS_KEY, JSON.stringify(patientRegistry));
+      } catch {}
+    }, 300);
+    return () => clearTimeout(t);
+  }, [patientRegistry, persistLocal]);
 
   useEffect(() => {
     setSupportsSpeech(!!SpeechRecognition);
@@ -922,6 +976,60 @@ export default function App() {
     }
   };
 
+  const registryKeyFor = (p) => {
+    const record = safeTrim(p?.record);
+    if (record) return `record:${record.toLowerCase()}`;
+    const name = safeTrim(p?.name).toLowerCase();
+    const phone = digitsOnly(p?.phone);
+    if (name || phone) return `name:${name}|phone:${phone}`;
+    return "";
+  };
+
+  const savePatientToRegistry = () => {
+    const name = safeTrim(patient?.name);
+    if (!name) {
+      setRegistryNotice("Ingresá al menos el nombre del paciente para guardarlo.");
+      return;
+    }
+    const key = registryKeyFor(patient);
+    const now = new Date().toISOString();
+    setPatientRegistry((prev) => {
+      const idx = key ? prev.findIndex((p) => p.key === key) : -1;
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = { ...next[idx], ...patient, key, updatedAt: now };
+        return next;
+      }
+      return [
+        {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+          key,
+          ...patient,
+          updatedAt: now,
+        },
+        ...prev,
+      ];
+    });
+    setRegistryNotice("Paciente guardado en el registro.");
+  };
+
+  const loadPatientFromRegistry = (entry) => {
+    if (!entry) return;
+    setPatient({
+      name: entry.name || "",
+      age: entry.age || "",
+      sex: entry.sex || "",
+      dpi: entry.dpi || "",
+      phone: entry.phone || "",
+      record: entry.record || "",
+    });
+    setRegistryNotice(`Paciente "${entry.name || "sin nombre"}" cargado.`);
+  };
+
+  const removePatientFromRegistry = (entryId) => {
+    setPatientRegistry((prev) => prev.filter((p) => p.id !== entryId));
+  };
+
   const reportText = useMemo(() => {
     const lines = [];
     lines.push("INFORME DE CONSULTA (Borrador)");
@@ -948,6 +1056,10 @@ export default function App() {
     lines.push(buildConclusion(sections));
     lines.push("");
 
+    lines.push("SUGERENCIA AUTOMÁTICA (REFERENCIA)");
+    lines.push(buildSuggestionSummary(sections, icd10Suggestions));
+    lines.push("");
+
     if (safeTrim(fullTranscript)) {
       lines.push("TRANSCRIPCIÓN COMPLETA");
       lines.push(safeTrim(fullTranscript));
@@ -955,6 +1067,11 @@ export default function App() {
 
     return lines.join("\n");
   }, [meta, patient, sections, fullTranscript, icd10Suggestions]);
+
+  const suggestionSummary = useMemo(
+    () => buildSuggestionSummary(sections, icd10Suggestions),
+    [sections, icd10Suggestions]
+  );
 
   // PDF preview (auto)
   useEffect(() => {
@@ -1286,6 +1403,53 @@ export default function App() {
             </div>
 
             <div className={cn("mt-4 rounded-2xl p-4", CARD)}>
+              <h2 className="text-sm font-semibold text-slate-700">Registro de pacientes</h2>
+              <div className="mt-3 grid gap-3">
+                <button
+                  onClick={savePatientToRegistry}
+                  className={cn("rounded-xl px-3 py-2 text-sm font-semibold", BTN, BTN_PRIMARY)}
+                >
+                  Guardar paciente actual
+                </button>
+                {registryNotice && (
+                  <div className="text-xs text-slate-600">{registryNotice}</div>
+                )}
+                <div className={cn("rounded-xl p-3", INSET)}>
+                  {patientRegistry.length === 0 ? (
+                    <div className="text-xs text-slate-500">(Sin pacientes registrados aún)</div>
+                  ) : (
+                    <ul className="space-y-2">
+                      {patientRegistry.map((p) => (
+                        <li key={p.id} className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-700">
+                          <div>
+                            <div className="font-semibold text-slate-800">{p.name || "(sin nombre)"}</div>
+                            <div className="text-slate-500">
+                              {p.record ? `Expediente: ${p.record}` : "Expediente no indicado"}
+                            </div>
+                          </div>
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => loadPatientFromRegistry(p)}
+                              className={cn("rounded-lg px-2 py-1 text-xs font-semibold", BTN, "text-slate-800")}
+                            >
+                              Cargar
+                            </button>
+                            <button
+                              onClick={() => removePatientFromRegistry(p.id)}
+                              className={cn("rounded-lg px-2 py-1 text-xs font-semibold text-rose-700", BTN)}
+                            >
+                              Quitar
+                            </button>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className={cn("mt-4 rounded-2xl p-4", CARD)}>
               <h2 className="text-sm font-semibold text-slate-700">Metadatos</h2>
               <div className="mt-3 grid gap-3">
                 <div>
@@ -1420,6 +1584,10 @@ export default function App() {
                 <h2 className="text-sm font-semibold text-slate-700">Informe (exportable)</h2>
                 <div className={cn("mt-3 rounded-xl p-3", INSET)}>
                   <textarea value={reportText} readOnly rows={12} className="w-full resize-y bg-transparent text-sm text-slate-800 outline-none" />
+                </div>
+                <div className={cn("mt-3 rounded-xl p-3 text-xs text-slate-700", INSET)}>
+                  <div className="text-xs font-semibold text-slate-600">Sugerencia automática (referencia)</div>
+                  <div className="mt-1 text-sm text-slate-800">{suggestionSummary}</div>
                 </div>
                 <div className="mt-2 flex flex-wrap gap-2">
                   <button onClick={() => copyToClipboard(reportText)} className={cn("rounded-xl px-3 py-2 text-sm font-semibold", BTN, BTN_PRIMARY)}>
